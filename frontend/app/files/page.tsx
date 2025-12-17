@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Button,
   Card,
@@ -35,12 +36,23 @@ type Profile = {
   };
 };
 
+type AnalyzeOut = {
+  suggestions: Array<{
+    title: string;
+    description: string;
+    cell_type: "python" | "markdown";
+    code: string;
+  }>;
+};
+
 export default function FilesPage() {
+  const router = useRouter();
   const projectId = useAppStore((s) => s.selectedProjectId);
   const [files, setFiles] = useState<FileRow[]>([]);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [suggestions, setSuggestions] = useState<AnalyzeOut["suggestions"]>([]);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +81,7 @@ export default function FilesPage() {
     setSelectedFileId(fileId);
     setPreview(null);
     setProfile(null);
+    setSuggestions([]);
     setLoading(true);
     setError(null);
     try {
@@ -169,7 +182,31 @@ export default function FilesPage() {
         </Card>
 
         <Card>
-          <div className="text-sm font-semibold">Preview</div>
+          <div className="flex items-center justify-between">
+            <div className="text-sm font-semibold">Preview</div>
+            <Button
+              size="xs"
+              color="gray"
+              disabled={!selectedFileId || loading}
+              onClick={async () => {
+                if (!projectId || !selectedFileId) return;
+                setLoading(true);
+                setError(null);
+                try {
+                  const out = await apiGet<AnalyzeOut>(
+                    `/projects/${projectId}/files/${selectedFileId}/analyze`
+                  );
+                  setSuggestions(out.suggestions || []);
+                } catch (e: any) {
+                  setError(e?.message || String(e));
+                } finally {
+                  setLoading(false);
+                }
+              }}
+            >
+              Analyze with AI
+            </Button>
+          </div>
           {!preview ? (
             <div className="mt-2 text-sm text-gray-600">Select a file to load preview.</div>
           ) : (
@@ -196,6 +233,56 @@ export default function FilesPage() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {suggestions.length > 0 && (
+            <div className="mt-4 border-t pt-3">
+              <div className="text-sm font-semibold">Suggestions</div>
+              <div className="mt-2 space-y-2">
+                {suggestions.map((s, idx) => (
+                  <Card key={idx} className="bg-gray-50">
+                    <div className="text-sm font-semibold">{s.title}</div>
+                    {s.description && (
+                      <div className="mt-1 text-xs text-gray-600">{s.description}</div>
+                    )}
+                    <div className="mt-2 flex gap-2">
+                      <Button
+                        size="xs"
+                        onClick={async () => {
+                          if (!projectId) return;
+                          await fetch(`${API_BASE_URL}/projects/${projectId}/workspace/cells`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ type: s.cell_type, source: s.code }),
+                          });
+                          router.push("/workspace");
+                        }}
+                      >
+                        Create cell
+                      </Button>
+                      <Button
+                        size="xs"
+                        color="gray"
+                        onClick={async () => {
+                          if (!projectId) return;
+                          const res = await fetch(`${API_BASE_URL}/projects/${projectId}/workspace/cells`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ type: s.cell_type, source: s.code }),
+                          });
+                          if (!res.ok) throw new Error(await res.text());
+                          const cell = await res.json();
+                          await fetch(`${API_BASE_URL}/projects/${projectId}/workspace/cells/${cell.id}/run`, { method: "POST" });
+                          router.push("/workspace");
+                        }}
+                      >
+                        Create + run
+                      </Button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
             </div>
           )}
         </Card>

@@ -6,9 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import asyncio
+
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,10 +23,13 @@ from app.schemas import (
     ChatMessageCreate,
     ChatMessageOut,
     ExecuteOut,
+    FileAnalyzeOut,
+    FileAnalysisSuggestion,
     FileOut,
     FilePreviewOut,
     FileProfileOut,
     ProjectCreate,
+    ProjectContextOut,
     ProjectOut,
     ProjectPatch,
     SavedQueryCreate,
@@ -67,6 +72,17 @@ async def health() -> dict[str, str]:
 
 def _project_dir(project_id: uuid.UUID) -> Path:
     return DATA_ROOT / str(project_id)
+
+
+def _sse(data: str, event: str | None = None) -> str:
+    # Minimal Server-Sent Events formatting.
+    out = ""
+    if event:
+        out += f"event: {event}\n"
+    for line in data.splitlines() or [""]:
+        out += f"data: {line}\n"
+    out += "\n"
+    return out
 
 
 async def _run_cell(project: Project, cell: WorkspaceCell, *, db: AsyncSession, tdb: AsyncSession) -> ExecuteOut:
@@ -136,6 +152,31 @@ async def get_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     if not p:
         raise HTTPException(404, "Project not found")
     return ProjectOut.model_validate(p, from_attributes=True)
+
+
+@app.get("/projects/{project_id}/context", response_model=ProjectContextOut)
+async def project_context(
+    project_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    tdb: AsyncSession = Depends(get_target_db),
+) -> ProjectContextOut:
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    schema = await get_schema_summary(tdb)
+    files = (
+        await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id).order_by(ProjectFile.created_at.desc()))
+    ).scalars().all()
+    cells = (
+        await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.executed_at.desc().nullslast(), WorkspaceCell.position.desc()).limit(5))
+    ).scalars().all()
+
+    return ProjectContextOut(
+        schema_summary=schema[:4000],
+        files=[FileOut.model_validate(f, from_attributes=True) for f in files[:10]],
+        recent_cells=[WorkspaceCellOut.model_validate(c, from_attributes=True) for c in cells],
+    )
 
 
 @app.patch("/projects/{project_id}", response_model=ProjectOut)
@@ -227,6 +268,68 @@ async def chat(project_id: uuid.UUID, payload: ChatMessageCreate, db: AsyncSessi
     await db.commit()
     await db.refresh(assistant_msg)
     return ChatMessageOut.model_validate(assistant_msg, from_attributes=True)
+
+
+@app.post("/projects/{project_id}/chat/stream")
+async def chat_stream(
+    project_id: uuid.UUID,
+    payload: ChatMessageCreate,
+    db: AsyncSession = Depends(get_db),
+    tdb: AsyncSession = Depends(get_target_db),
+) -> StreamingResponse:
+    project = await db.get(Project, project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    user_msg = ChatMessage(project_id=project_id, role="user", content=payload.message, meta={})
+    db.add(user_msg)
+    await db.commit()
+
+    schema = await get_schema_summary(tdb)
+
+    async def gen() -> Any:
+        yield _sse("starting", event="status")
+        await asyncio.sleep(0)
+
+        assistant_text = ""
+        meta: dict[str, Any] = {}
+        try:
+            sql = await generate_sql(project, question=payload.message, schema_summary=schema)
+            if not project.allow_writes:
+                assert_read_only(sql)
+            res = await tdb.execute(text(sql))
+            rows = res.fetchmany(10)
+            cols = list(res.keys())
+            assistant_text = (
+                "Here’s a SQL query you can run:\n\n"
+                f"{sql}\n\n"
+                "Preview (first 10 rows):\n"
+                f"Columns: {cols}\n"
+                f"Rows: {rows}"
+            )
+            meta = {
+                "actions": [
+                    {"type": "insert_sql", "sql": sql},
+                    {"type": "create_sql_cell", "sql": sql},
+                ],
+                "citations": [{"type": "postgres_schema", "summary": schema[:2000]}],
+            }
+        except Exception as e:  # noqa: BLE001
+            assistant_text = f"I couldn’t generate/run SQL automatically: {e}. You can still use the SQL page."
+            meta = {"citations": [{"type": "postgres_schema", "summary": schema[:2000]}]}
+
+        # Stream content in chunks (v1); can be replaced with true token streaming later.
+        for i in range(0, len(assistant_text), 80):
+            yield _sse(assistant_text[i : i + 80], event="delta")
+            await asyncio.sleep(0)
+
+        assistant_msg = ChatMessage(project_id=project_id, role="assistant", content=assistant_text, meta=meta)
+        db.add(assistant_msg)
+        await db.commit()
+
+        yield _sse("done", event="status")
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 # ---------------- SQL ----------------
@@ -342,6 +445,94 @@ async def get_file_profile(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncS
         await db.commit()
 
     return FileProfileOut(profile=pf.profile)
+
+
+@app.post("/projects/{project_id}/files/{file_id}/analyze", response_model=FileAnalyzeOut)
+async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> FileAnalyzeOut:
+    pf = await db.get(ProjectFile, file_id)
+    if not pf or pf.project_id != project_id:
+        raise HTTPException(404, "File not found")
+
+    # Ensure profile exists (used to pick columns).
+    if pf.profile is None:
+        pf.profile = await profile_file(pf.path)
+        await db.commit()
+
+    profile = pf.profile or {}
+    cols = profile.get("columns", []) if isinstance(profile, dict) else []
+
+    numeric: list[str] = []
+    categorical: list[str] = []
+    for c in cols:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        dtype = str(c.get("dtype", "")).lower()
+        if isinstance(name, str) and ("int" in dtype or "float" in dtype or "number" in dtype):
+            numeric.append(name)
+        if isinstance(name, str) and c.get("top_values"):
+            categorical.append(name)
+
+    # Build deterministic suggestions (LLM integration can be layered on top).
+    read_code = (
+        "import pandas as pd\n"
+        f"path = {pf.path!r}\n"
+        "ext = path.lower().split('.')[-1]\n"
+        "if ext in ['csv','tsv']:\n"
+        "    df = pd.read_csv(path, sep='\\t' if ext=='tsv' else ',')\n"
+        "elif ext in ['xlsx','xls']:\n"
+        "    df = pd.read_excel(path)\n"
+        "elif ext in ['parquet']:\n"
+        "    df = pd.read_parquet(path)\n"
+        "else:\n"
+        "    raise ValueError('Unsupported file type')\n"
+    )
+
+    suggestions: list[FileAnalysisSuggestion] = []
+    suggestions.append(
+        FileAnalysisSuggestion(
+            title="Load file and show head()",
+            description="Load the uploaded file into a DataFrame and preview rows.",
+            code=read_code + "\n__table__ = df.head(20)\n",
+        )
+    )
+
+    if numeric:
+        c0 = numeric[0]
+        suggestions.append(
+            FileAnalysisSuggestion(
+                title=f"Histogram of {c0}",
+                description="Distribution of a numeric column.",
+                code=read_code
+                + f"\nfig = px.histogram(df, x={c0!r})\n__plotly_json__ = fig.to_dict()\n",
+            )
+        )
+
+    if len(numeric) >= 2:
+        x, y = numeric[0], numeric[1]
+        suggestions.append(
+            FileAnalysisSuggestion(
+                title=f"Scatter: {x} vs {y}",
+                description="Relationship between two numeric columns.",
+                code=read_code
+                + f"\nfig = px.scatter(df, x={x!r}, y={y!r})\n__plotly_json__ = fig.to_dict()\n",
+            )
+        )
+
+    if categorical:
+        cat = categorical[0]
+        suggestions.append(
+            FileAnalysisSuggestion(
+                title=f"Top categories of {cat}",
+                description="Bar chart of most frequent values.",
+                code=read_code
+                + f"\ncounts = df[{cat!r}].astype(str).value_counts().head(20).reset_index()\n"
+                + "counts.columns = ['value','count']\n"
+                + "\nfig = px.bar(counts, x='value', y='count')\n__plotly_json__ = fig.to_dict()\n",
+            )
+        )
+
+    return FileAnalyzeOut(suggestions=suggestions[:8])
 
 
 # ---------------- Workspace ----------------

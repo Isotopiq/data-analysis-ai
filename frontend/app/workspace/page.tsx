@@ -137,6 +137,37 @@ export default function WorkspacePage() {
                 </div>
               </div>
               <div className="flex gap-2">
+                <Button
+                  size="xs"
+                  color="gray"
+                  disabled={loading}
+                  onClick={async () => {
+                    const idx = cells.findIndex((x) => x.id === c.id);
+                    if (idx <= 0) return;
+                    const prev = cells[idx - 1];
+                    // swap positions
+                    await apiPatch(`/projects/${projectId}/workspace/cells/${c.id}`, { position: prev.position });
+                    await apiPatch(`/projects/${projectId}/workspace/cells/${prev.id}`, { position: c.position });
+                    await refresh();
+                  }}
+                >
+                  ↑
+                </Button>
+                <Button
+                  size="xs"
+                  color="gray"
+                  disabled={loading}
+                  onClick={async () => {
+                    const idx = cells.findIndex((x) => x.id === c.id);
+                    if (idx < 0 || idx >= cells.length - 1) return;
+                    const next = cells[idx + 1];
+                    await apiPatch(`/projects/${projectId}/workspace/cells/${c.id}`, { position: next.position });
+                    await apiPatch(`/projects/${projectId}/workspace/cells/${next.id}`, { position: c.position });
+                    await refresh();
+                  }}
+                >
+                  ↓
+                </Button>
                 {(c.type === "python" || c.type === "sql") && (
                   <Button
                     size="xs"

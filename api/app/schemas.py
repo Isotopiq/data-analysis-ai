@@ -96,6 +96,23 @@ class FileProfileOut(BaseModel):
     profile: dict[str, Any]
 
 
+class FileAnalysisSuggestion(BaseModel):
+    title: str
+    description: str = ""
+    cell_type: Literal["python", "markdown"] = "python"
+    code: str
+
+
+class FileAnalyzeOut(BaseModel):
+    suggestions: list[FileAnalysisSuggestion]
+
+
+class ProjectContextOut(BaseModel):
+    schema_summary: str
+    files: list[FileOut]
+    recent_cells: list[WorkspaceCellOut]
+
+
 class WorkspaceCellCreate(BaseModel):
     type: CellType
     source: str = ""

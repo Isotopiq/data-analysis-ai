@@ -5,12 +5,13 @@ import { Button, Card, Label, Select, TextInput } from "flowbite-react";
 
 import { Monaco } from "@/components/Monaco";
 import { Plot } from "@/components/PlotlyChart";
-import { apiPost } from "@/lib/api";
+import { apiGet, apiPost } from "@/lib/api";
 import { useAppStore } from "@/lib/store";
 
 type SQLGenerateOut = { sql: string; explanation: string; safety_notes: string };
 
 type SQLRunOut = { columns: string[]; rows: any[][]; row_count: number };
+type SavedQuery = { id: string; name: string; sql: string; created_at: string };
 
 export default function SqlPage() {
   const projectId = useAppStore((s) => s.selectedProjectId);
@@ -25,11 +26,26 @@ export default function SqlPage() {
 
   const [xCol, setXCol] = useState<string>("");
   const [yCol, setYCol] = useState<string>("");
+  const [saved, setSaved] = useState<SavedQuery[]>([]);
+  const [saveName, setSaveName] = useState("");
 
   useEffect(() => {
     if (sqlDraft && !sql) setSql(sqlDraft);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sqlDraft]);
+
+  useEffect(() => {
+    async function loadSaved() {
+      if (!projectId) return;
+      try {
+        const data = await apiGet<SavedQuery[]>(`/projects/${projectId}/sql/saved`);
+        setSaved(data);
+      } catch {
+        // ignore
+      }
+    }
+    loadSaved();
+  }, [projectId]);
 
   const columns = result?.columns || [];
   const plotData = useMemo(() => {
@@ -128,6 +144,63 @@ export default function SqlPage() {
           </div>
         </div>
 
+        <div className="mt-4 grid grid-cols-1 gap-2 md:grid-cols-3">
+          <div className="md:col-span-2">
+            <Label>Save query</Label>
+            <div className="mt-1 flex gap-2">
+              <TextInput
+                className="flex-1"
+                value={saveName}
+                onChange={(e) => setSaveName(e.target.value)}
+                placeholder="e.g. Top 10 rows"
+              />
+              <Button
+                color="gray"
+                disabled={loading || !saveName.trim() || !sql.trim()}
+                onClick={async () => {
+                  if (!projectId) return;
+                  setLoading(true);
+                  setError(null);
+                  try {
+                    await apiPost(`/projects/${projectId}/sql/saved`, { name: saveName, sql });
+                    const data = await apiGet<SavedQuery[]>(`/projects/${projectId}/sql/saved`);
+                    setSaved(data);
+                    setSaveName("");
+                  } catch (e: any) {
+                    setError(e?.message || String(e));
+                  } finally {
+                    setLoading(false);
+                  }
+                }}
+              >
+                Save
+              </Button>
+            </div>
+          </div>
+          <div>
+            <Label>Saved</Label>
+            <Select
+              className="mt-1"
+              value=""
+              onChange={(e) => {
+                const id = e.target.value;
+                const q = saved.find((s) => s.id === id);
+                if (q) {
+                  setSql(q.sql);
+                  setSqlDraft(q.sql);
+                }
+              }}
+            >
+              <option value="">Select…</option>
+              {saved.map((q) => (
+                <option key={q.id} value={q.id}>
+                  {q.name}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+
         <div className="mt-4">
           <Label>SQL editor</Label>
           <div className="mt-2 h-64 overflow-hidden rounded border">
@@ -151,6 +224,28 @@ export default function SqlPage() {
           <div className="flex items-center justify-between">
             <div className="text-sm font-semibold">Results</div>
             <div className="text-xs text-gray-500">Rows: {result.row_count} (preview)</div>
+          </div>
+
+          <div className="mt-3 flex gap-2">
+            <Button
+              size="xs"
+              color="gray"
+              onClick={async () => {
+                if (!projectId) return;
+                // Create a python cell that reconstructs a DataFrame from the previewed results.
+                const columns = result.columns;
+                const rows = result.rows;
+                const code =
+                  "import pandas as pd\n"
+                  + `columns = ${JSON.stringify(columns)}\n`
+                  + `rows = ${JSON.stringify(rows)}\n`
+                  + "df = pd.DataFrame(rows, columns=columns)\n"
+                  + "__table__ = df.head(200)\n";
+                await apiPost(`/projects/${projectId}/workspace/cells`, { type: "python", source: code });
+              }}
+            >
+              Send result to workspace
+            </Button>
           </div>
 
           <div className="mt-3 overflow-auto">

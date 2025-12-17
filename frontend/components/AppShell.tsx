@@ -14,6 +14,7 @@ import {
 } from "react-icons/hi";
 
 import { useAppStore } from "@/lib/store";
+import { ProjectContextDrawer } from "@/components/ProjectContextDrawer";
 
 const navItems = [
   { href: "/projects", label: "Projects", icon: HiCollection },
@@ -78,8 +79,8 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
         <aside className="hidden xl:block w-80 border-l bg-white p-4">
           <div className="text-sm font-semibold">Context</div>
-          <div className="mt-2 text-xs text-gray-600">
-            Selected project, recent tables/files, and memory will appear here.
+          <div className="mt-3">
+            <ProjectContextDrawer />
           </div>
         </aside>
       </div>

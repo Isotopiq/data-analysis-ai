@@ -1,0 +1,438 @@
+Unified Julius-like Web App (Option 3) — Build Specification
+Goal
+
+Build a single unified web application (one GUI) that provides:
+
+Chat-based assistant for data work
+
+PostgreSQL querying via natural language → SQL, plus a SQL editor
+
+File upload + analysis (CSV/XLSX/Parquet at minimum) with profiling + Plotly charts
+
+A notebook-like “workspace” with runnable code cells (Python) and markdown cells
+
+Export to .ipynb of the workspace so analyses are reproducible outside the app
+
+Support both local LLM and API LLM options (selectable per project/session)
+
+Single app, single login/session context, everything stored as “Projects”.
+
+Tech Stack Requirements
+Frontend
+
+Next.js (React) app
+
+TailwindCSS + Flowbite components
+
+Plotly.js for charts
+
+Monaco Editor for:
+
+SQL editor
+
+Python code cells
+
+Layout should be modern, clean, and “Julius-like”:
+
+Left sidebar navigation: Projects, Chat, Files, SQL, Workspace, Exports, Settings
+
+Main pane shows chosen tool
+
+Right drawer optionally shows “Context” (selected tables/files, schema summary, conversation memory)
+
+Backend
+
+FastAPI (Python) REST API
+
+PostgreSQL only for database querying and app persistence
+
+Use SQLAlchemy (or asyncpg) for DB connections
+
+Use a job execution worker for Python code execution (do not execute user code inside the FastAPI web process)
+
+Can be implemented as a separate Docker container (“executor”)
+
+Optional job queue: Redis + RQ/Celery (preferred), but a simple internal queue is acceptable for v1
+
+LLM Support
+
+App must support:
+
+Local LLM (primary) via Ollama (Dockerized)
+
+API LLM (secondary/fallback) via a provider such as OpenAI-compatible API
+
+The user can choose model provider:
+
+“Local (Ollama)” with selectable model name (e.g., llama3, qwen2.5, mistral)
+
+“API” with base URL + API key (store securely)
+
+LLM should be used for:
+
+Natural language → SQL generation
+
+File analysis suggestions (profiling + recommended plots)
+
+Creating workspace code cells from chat instructions
+
+Summarizing results
+
+Core Product Concepts & Data Model
+Project
+
+A “Project” is the unit of work. It contains:
+
+Chat history
+
+Connected Postgres credentials (host/db/user/password/ssl) or uses a single configured DB connection (choose one approach)
+
+Uploaded files metadata + storage paths
+
+Workspace cells (ordered list of cells)
+
+Saved SQL queries
+
+LLM settings (provider, model, temperature, etc.)
+
+Workspace Cells
+
+Cells are notebook-like objects:
+
+Types: markdown, python, sql, output
+
+Each code cell stores:
+
+source text
+
+execution status (idle/running/success/error)
+
+stdout/stderr
+
+results (tables, plotly JSON, plain text)
+
+execution timestamp + runtime
+
+Cells can be re-ordered, edited, rerun individually
+
+Add “Run all” button
+
+File Storage
+
+Uploaded files are stored on disk in the backend container under a project directory:
+
+data/projects/<project_id>/uploads/<filename>
+Store metadata in Postgres:
+
+file id, name, size, type, upload time
+
+inferred schema/preview stats
+
+App Pages / Features (Unified GUI)
+1) Projects Page
+
+Create / rename / delete projects
+
+Selecting a project loads its context (chat, files, sql, workspace)
+
+2) Chat Page (Julius-like)
+
+Chat UI with message streaming
+
+Chat uses current project context:
+
+selected Postgres schema summary
+
+selected files + their column summaries
+
+recent workspace cells
+
+Chat can “create artifacts”:
+
+button actions in assistant responses:
+
+“Insert SQL into SQL Editor”
+
+“Create Python cell in Workspace”
+
+“Run this cell”
+
+“Save as query”
+
+Chat should show citations to the source of context:
+
+“From Postgres schema: table X columns…”
+
+“From file: filename.csv…”
+
+3) SQL Page
+
+SQL editor (Monaco) + run button
+
+Results display:
+
+tabular grid with pagination
+
+option to “Send result to Workspace” (creates a python cell that loads the result)
+
+option to “Plot” (choose x/y/group and generate Plotly)
+
+NL→SQL panel:
+
+user types a question (“show top 20 metabolites by intensity”)
+
+LLM returns:
+
+SQL (editable)
+
+brief explanation
+
+safety notes (read-only by default)
+
+Safety:
+
+Default to read-only SQL mode (SELECT only)
+
+If user enables “Allow writes”, require explicit toggle in Settings
+
+4) Files Page
+
+Upload files (CSV/XLSX/Parquet initially; PDFs optional)
+
+After upload, run profiling:
+
+column names, types, missingness
+
+basic stats for numeric columns
+
+top values for categorical columns
+
+Preview table (first N rows)
+
+“Analyze with AI”:
+
+LLM suggests 3–8 useful plots and analyses
+
+clicking a suggestion creates code cells in Workspace and runs them
+
+“Query file like a table” is optional in v1; if implemented, load into pandas in executor
+
+5) Workspace Page (Notebook-like)
+
+Cell list with add buttons:
+
+Add markdown cell
+
+Add python cell
+
+Add sql cell (which runs via DB and stores results)
+
+Each cell has:
+
+editor area
+
+run button
+
+output area
+
+Output types:
+
+plain text
+
+dataframe table
+
+Plotly chart rendering
+
+Variables/state:
+
+Per-project Python session state is nice-to-have, but v1 can execute cells independently
+
+If persistent session is implemented, it must be inside the executor container per project
+
+6) Exports Page
+
+Export current workspace to:
+
+.ipynb notebook (required)
+
+optional .html report
+
+Notebook should include:
+
+markdown cells as markdown
+
+python cells as code
+
+outputs embedded (text + plotly as HTML or JSON)
+
+Include metadata header:
+
+project name, export time, environment notes
+
+7) Settings Page
+
+Configure LLM:
+
+Provider: Local (Ollama) or API
+
+Model name
+
+API base URL + key (store as secret)
+
+Configure Postgres:
+
+Connection string (or env-driven)
+
+SQL safety toggles:
+
+read-only default
+
+allow writes (explicit toggle)
+
+Backend API Endpoints (Minimum)
+
+Implement REST endpoints like:
+
+Projects
+
+POST /projects
+
+GET /projects
+
+GET /projects/{id}
+
+PATCH /projects/{id}
+
+DELETE /projects/{id}
+
+Chat
+
+POST /projects/{id}/chat (streaming response)
+
+GET /projects/{id}/chat/history
+
+SQL
+
+POST /projects/{id}/sql/generate (NL→SQL)
+
+POST /projects/{id}/sql/run
+
+GET /projects/{id}/sql/saved
+
+POST /projects/{id}/sql/saved
+
+Files
+
+POST /projects/{id}/files/upload
+
+GET /projects/{id}/files
+
+GET /projects/{id}/files/{file_id}/preview
+
+GET /projects/{id}/files/{file_id}/profile
+
+Workspace
+
+GET /projects/{id}/workspace
+
+POST /projects/{id}/workspace/cells
+
+PATCH /projects/{id}/workspace/cells/{cell_id}
+
+POST /projects/{id}/workspace/cells/{cell_id}/run
+
+POST /projects/{id}/workspace/run_all
+
+Export
+
+POST /projects/{id}/export/ipynb (returns file download)
+
+Execution/Sandbox Rules (Critical)
+
+Python execution must happen in a separate executor service container.
+
+Enforce:
+
+time limit per cell (e.g., 30–120s)
+
+memory cap
+
+disable outbound network by default (configurable)
+
+Executor returns:
+
+stdout/stderr
+
+structured results:
+
+tables (as Arrow/JSON)
+
+plotly JSON
+
+text
+
+Docker Compose (Required)
+
+Provide a docker-compose.yml that brings up:
+
+frontend (Next.js)
+
+api (FastAPI)
+
+postgres (app persistence; can be the same DB used for querying, but best is separate “appdb” vs “targetdb”)
+
+ollama (local LLM)
+
+executor (python runner)
+
+optional redis (if using job queue)
+
+Use environment variables for:
+
+Postgres connection strings
+
+API keys
+
+Ollama base URL
+
+UX Requirements (Make it Feel Like One App)
+
+Everything scoped to the selected Project
+
+Consistent top bar showing:
+
+project name
+
+LLM provider + model
+
+Postgres connection status
+
+Assistant responses should include “action buttons”:
+
+Create SQL cell
+
+Insert into SQL editor
+
+Create Python cell
+
+Run in workspace
+
+Use Flowbite components for:
+
+tables, modals, tabs, sidebars, dropdowns, toasts
+
+Definition of Done (Acceptance Criteria)
+
+User can create a project and select it.
+
+User can connect to Postgres (read-only).
+
+User can ask chat: “show me top 10 rows of table X” → app generates SQL and runs it.
+
+User can upload a CSV and see profiling + preview.
+
+User can generate a Plotly chart from file data and see it rendered.
+
+User can create/run notebook-like cells and see outputs.
+
+User can export workspace to a valid .ipynb that reopens in Jupyter.

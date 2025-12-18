@@ -632,18 +632,105 @@ async def export_ipynb(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)
         )
     )
 
+    def _attach_outputs(nb_cell: Any, ws_cell: WorkspaceCell) -> None:
+        # Attach outputs captured by the app so notebooks reopen with results.
+        # Supports:
+        # - stdout/stderr streams
+        # - result.type: text/table/plotly
+        if getattr(ws_cell, "stdout", None):
+            nb_cell.outputs.append(nbf.v4.new_output("stream", name="stdout", text=ws_cell.stdout))
+        if getattr(ws_cell, "stderr", None):
+            nb_cell.outputs.append(nbf.v4.new_output("stream", name="stderr", text=ws_cell.stderr))
+
+        result = ws_cell.result or None
+        if not isinstance(result, dict):
+            return
+
+        rtype = result.get("type")
+        if rtype == "text":
+            text_out = str(result.get("text", ""))
+            nb_cell.outputs.append(
+                nbf.v4.new_output(
+                    "execute_result",
+                    data={"text/plain": text_out},
+                    metadata={},
+                    execution_count=1,
+                )
+            )
+            return
+
+        if rtype == "table":
+            cols = result.get("columns") or []
+            rows_ = result.get("rows") or []
+            try:
+                preview = "Columns: " + ", ".join([str(c) for c in cols]) + "\nRows (first 50):\n" + "\n".join(
+                    [str(r) for r in rows_[:50]]
+                )
+            except Exception:
+                preview = str(result)[:4000]
+
+            nb_cell.outputs.append(
+                nbf.v4.new_output(
+                    "execute_result",
+                    data={
+                        "text/plain": preview,
+                        "application/json": {"columns": cols, "rows": rows_},
+                    },
+                    metadata={},
+                    execution_count=1,
+                )
+            )
+            return
+
+        if rtype == "plotly":
+            fig = result.get("figure")
+            if isinstance(fig, dict):
+                nb_cell.outputs.append(
+                    nbf.v4.new_output(
+                        "display_data",
+                        data={
+                            "application/vnd.plotly.v1+json": fig,
+                            "text/plain": "Plotly figure",
+                        },
+                        metadata={},
+                    )
+                )
+            return
+
     for c in rows:
         if c.type.value == "markdown":
-            nb.cells.append(nbf.v4.new_markdown_cell(c.source))
+            md = nbf.v4.new_markdown_cell(c.source)
+            md.metadata["unified_data_app"] = {
+                "cell_id": str(c.id),
+                "type": "markdown",
+                "position": c.position,
+            }
+            nb.cells.append(md)
         elif c.type.value == "python":
             cell = nbf.v4.new_code_cell(c.source)
-            if c.stdout:
-                cell.outputs.append(nbf.v4.new_output("stream", name="stdout", text=c.stdout))
-            if c.stderr:
-                cell.outputs.append(nbf.v4.new_output("stream", name="stderr", text=c.stderr))
+            cell.metadata["unified_data_app"] = {
+                "cell_id": str(c.id),
+                "type": "python",
+                "position": c.position,
+                "status": str(c.status),
+                "executed_at": c.executed_at.isoformat() + "Z" if c.executed_at else None,
+                "runtime_ms": c.runtime_ms,
+            }
+            _attach_outputs(cell, c)
             nb.cells.append(cell)
         elif c.type.value == "sql":
-            nb.cells.append(nbf.v4.new_markdown_cell("```sql\n" + c.source + "\n```"))
+            # Export SQL as a code cell so results can be embedded.
+            sql_cell = nbf.v4.new_code_cell(c.source)
+            sql_cell.metadata["unified_data_app"] = {
+                "cell_id": str(c.id),
+                "type": "sql",
+                "position": c.position,
+                "status": str(c.status),
+                "executed_at": c.executed_at.isoformat() + "Z" if c.executed_at else None,
+                "runtime_ms": c.runtime_ms,
+            }
+            _attach_outputs(sql_cell, c)
+            nb.cells.append(sql_cell)
 
     export_dir = _project_dir(project_id) / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)

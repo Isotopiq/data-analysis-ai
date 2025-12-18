@@ -151,17 +151,28 @@ export default function ChatPage() {
 
                   if (a.type === "create_sql_cell") {
                     return (
-                      <Button
-                        key={idx}
-                        size="xs"
-                        color="gray"
-                        onClick={async () => {
-                          await apiPost(`/projects/${projectId}/workspace/cells`, { type: "sql", source: a.sql || "" });
-                          router.push("/workspace");
-                        }}
-                      >
-                        Create SQL cell in workspace
-                      </Button>
+                      <div key={idx} className="flex gap-2">
+                        <Button
+                          size="xs"
+                          color="gray"
+                          onClick={async () => {
+                            await apiPost(`/projects/${projectId}/workspace/cells`, { type: "sql", source: a.sql || "" });
+                            router.push("/workspace");
+                          }}
+                        >
+                          Create SQL cell
+                        </Button>
+                        <Button
+                          size="xs"
+                          onClick={async () => {
+                            const cell = await apiPost<any>(`/projects/${projectId}/workspace/cells`, { type: "sql", source: a.sql || "" });
+                            await apiPost(`/projects/${projectId}/workspace/cells/${cell.id}/run`, {});
+                            router.push("/workspace");
+                          }}
+                        >
+                          Create + run
+                        </Button>
+                      </div>
                     );
                   }
 

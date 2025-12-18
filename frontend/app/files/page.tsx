@@ -134,7 +134,7 @@ export default function FilesPage() {
                   form.append("file", f);
                   const res = await fetch(
                     `${API_BASE_URL}/projects/${projectId}/files/upload`,
-                    { method: "POST", body: form }
+                    { method: "POST", body: form, credentials: "include" }
                   );
                   if (!res.ok) throw new Error(await res.text());
                   await refresh();
@@ -255,6 +255,7 @@ export default function FilesPage() {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ type: s.cell_type, source: s.code }),
+                            credentials: "include",
                           });
                           router.push("/workspace");
                         }}
@@ -270,10 +271,11 @@ export default function FilesPage() {
                             method: "POST",
                             headers: { "Content-Type": "application/json" },
                             body: JSON.stringify({ type: s.cell_type, source: s.code }),
+                            credentials: "include",
                           });
                           if (!res.ok) throw new Error(await res.text());
                           const cell = await res.json();
-                          await fetch(`${API_BASE_URL}/projects/${projectId}/workspace/cells/${cell.id}/run`, { method: "POST" });
+                          await fetch(`${API_BASE_URL}/projects/${projectId}/workspace/cells/${cell.id}/run`, { method: "POST", credentials: "include" });
                           router.push("/workspace");
                         }}
                       >

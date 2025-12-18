@@ -31,10 +31,23 @@ class ExecStatus(str, enum.Enum):
     error = "error"
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
+
+    projects: Mapped[list["Project"]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+
+
 class Project(Base):
     __tablename__ = "projects"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
 
     llm_provider: Mapped[LLMProvider] = mapped_column(Enum(LLMProvider), nullable=False, default=LLMProvider.ollama)
@@ -44,11 +57,14 @@ class Project(Base):
     api_base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    target_db_url_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
     allow_writes: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=datetime.utcnow)
 
+    owner: Mapped["User"] = relationship(back_populates="projects")
     chat_messages: Mapped[list[ChatMessage]] = relationship(back_populates="project", cascade="all, delete-orphan")
     files: Mapped[list[ProjectFile]] = relationship(back_populates="project", cascade="all, delete-orphan")
     cells: Mapped[list[WorkspaceCell]] = relationship(back_populates="project", cascade="all, delete-orphan")

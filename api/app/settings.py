@@ -18,5 +18,12 @@ class Settings(BaseSettings):
 
     cors_origins: str = "http://localhost:3000"
 
+    # Auth
+    auth_jwt_secret: str = "dev-only-jwt-secret-change-me"
+    auth_cookie_name: str = "uda_session"
+    auth_token_ttl_minutes: int = 60 * 24 * 7
+    admin_username: str = "admin"
+    admin_password: str = "admin"
+
 
 settings = Settings()

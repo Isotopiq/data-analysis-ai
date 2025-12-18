@@ -30,6 +30,7 @@ export default function ExportsPage() {
             onClick={async () => {
               const res = await fetch(`${API_BASE_URL}/projects/${projectId}/export/ipynb`, {
                 method: "POST",
+                credentials: "include",
               });
               if (!res.ok) throw new Error(await res.text());
               const blob = await res.blob();

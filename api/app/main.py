@@ -8,16 +8,18 @@ from typing import Any
 
 import asyncio
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import engine, get_db, get_target_db
+from app.auth import create_session_token, decode_session_token, hash_password, verify_password
+from app.auth_schemas import LoginIn, MeOut
+from app.db import engine, get_db
 from app.executor_client import execute_python, preview_file, profile_file
-from app.llm import generate_sql
-from app.models import Base, CellType, ChatMessage, ExecStatus, Project, ProjectFile, SavedQuery, WorkspaceCell
+from app.llm import chat_with_context, generate_file_suggestions, generate_sql
+from app.models import Base, CellType, ChatMessage, ExecStatus, Project, ProjectFile, SavedQuery, User, WorkspaceCell
 from app.schema_introspection import get_schema_summary
 from app.schemas import (
     ChatMessageCreate,
@@ -28,6 +30,7 @@ from app.schemas import (
     FileOut,
     FilePreviewOut,
     FileProfileOut,
+    DBTestOut,
     ProjectCreate,
     ProjectContextOut,
     ProjectOut,
@@ -42,9 +45,10 @@ from app.schemas import (
     WorkspaceCellOut,
     WorkspaceCellPatch,
 )
-from app.secrets import encrypt_str
+from app.secrets import decrypt_str, encrypt_str
 from app.settings import settings
 from app.sql_safety import assert_read_only
+from app.target_db import target_session
 
 app = FastAPI(title="Unified Data App API")
 
@@ -59,10 +63,49 @@ app.add_middleware(
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/data/projects"))
 
 
+def _get_user_id(request: Request) -> uuid.UUID:
+    user_id = getattr(request.state, "user_id", None)
+    if not isinstance(user_id, uuid.UUID):
+        raise HTTPException(401, "Not authenticated")
+    return user_id
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Best-effort lightweight migration for existing DBs
+        await conn.execute(text("alter table if exists projects add column if not exists owner_id uuid"))
+        await conn.execute(text("alter table if exists projects add column if not exists target_db_url_encrypted bytea"))
+
+    # Ensure a default admin user exists
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+    async with Session() as db:
+        existing = (await db.execute(select(User).where(User.username == settings.admin_username))).scalars().first()
+        if not existing:
+            u = User(username=settings.admin_username, password_hash=hash_password(settings.admin_password))
+            db.add(u)
+            await db.commit()
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    path = request.url.path
+    if path == "/health" or path.startswith("/auth/"):
+        return await call_next(request)
+
+    token = request.cookies.get(settings.auth_cookie_name)
+    if not token:
+        return Response(status_code=401, content="Not authenticated")
+
+    try:
+        request.state.user_id = decode_session_token(token)
+    except Exception:
+        return Response(status_code=401, content="Invalid session")
+
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -70,8 +113,52 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ---------------- Auth ----------------
+
+
+@app.post("/auth/login", response_model=MeOut)
+async def login(payload: LoginIn, response: Response, db: AsyncSession = Depends(get_db)) -> MeOut:
+    user = (await db.execute(select(User).where(User.username == payload.username))).scalars().first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
+
+    token = create_session_token(user_id=user.id)
+    response.set_cookie(
+        key=settings.auth_cookie_name,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=int(settings.auth_token_ttl_minutes) * 60,
+        path="/",
+    )
+    return MeOut(id=str(user.id), username=user.username)
+
+
+@app.post("/auth/logout")
+async def logout(response: Response) -> dict[str, str]:
+    response.delete_cookie(settings.auth_cookie_name, path="/")
+    return {"status": "ok"}
+
+
+@app.get("/auth/me", response_model=MeOut)
+async def me(request: Request, db: AsyncSession = Depends(get_db)) -> MeOut:
+    token = request.cookies.get(settings.auth_cookie_name)
+    if not token:
+        raise HTTPException(401, "Not authenticated")
+    user_id = decode_session_token(token)
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(401, "Invalid session")
+    return MeOut(id=str(user.id), username=user.username)
+
+
 def _project_dir(project_id: uuid.UUID) -> Path:
     return DATA_ROOT / str(project_id)
+
+
+def _project_target_url(project: Project) -> str | None:
+    return decrypt_str(project.target_db_url_encrypted) if project.target_db_url_encrypted else None
 
 
 def _sse(data: str, event: str | None = None) -> str:
@@ -130,41 +217,57 @@ async def _run_cell(project: Project, cell: WorkspaceCell, *, db: AsyncSession, 
 
 
 @app.post("/projects", response_model=ProjectOut)
-async def create_project(payload: ProjectCreate, db: AsyncSession = Depends(get_db)) -> ProjectOut:
-    p = Project(name=payload.name)
+async def create_project(payload: ProjectCreate, request: Request, db: AsyncSession = Depends(get_db)) -> ProjectOut:
+    user_id = _get_user_id(request)
+    p = Project(name=payload.name, owner_id=user_id)
     db.add(p)
     await db.commit()
     await db.refresh(p)
     _project_dir(p.id).mkdir(parents=True, exist_ok=True)
     (_project_dir(p.id) / "uploads").mkdir(parents=True, exist_ok=True)
-    return ProjectOut.model_validate(p, from_attributes=True)
+    out = ProjectOut.model_validate(p, from_attributes=True)
+    out.target_db_configured = bool(p.target_db_url_encrypted)
+    return out
 
 
 @app.get("/projects", response_model=list[ProjectOut])
-async def list_projects(db: AsyncSession = Depends(get_db)) -> list[ProjectOut]:
-    rows = (await db.execute(select(Project).order_by(Project.created_at.desc()))).scalars().all()
-    return [ProjectOut.model_validate(p, from_attributes=True) for p in rows]
+async def list_projects(request: Request, db: AsyncSession = Depends(get_db)) -> list[ProjectOut]:
+    user_id = _get_user_id(request)
+    rows = (
+        await db.execute(select(Project).where(Project.owner_id == user_id).order_by(Project.created_at.desc()))
+    ).scalars().all()
+    outs: list[ProjectOut] = []
+    for p in rows:
+        o = ProjectOut.model_validate(p, from_attributes=True)
+        o.target_db_configured = bool(p.target_db_url_encrypted)
+        outs.append(o)
+    return outs
 
 
 @app.get("/projects/{project_id}", response_model=ProjectOut)
-async def get_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> ProjectOut:
+async def get_project(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> ProjectOut:
+    user_id = _get_user_id(request)
     p = await db.get(Project, project_id)
-    if not p:
+    if not p or p.owner_id != user_id:
         raise HTTPException(404, "Project not found")
-    return ProjectOut.model_validate(p, from_attributes=True)
+    out = ProjectOut.model_validate(p, from_attributes=True)
+    out.target_db_configured = bool(p.target_db_url_encrypted)
+    return out
 
 
 @app.get("/projects/{project_id}/context", response_model=ProjectContextOut)
 async def project_context(
     project_id: uuid.UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    tdb: AsyncSession = Depends(get_target_db),
 ) -> ProjectContextOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
-    schema = await get_schema_summary(tdb)
+    async with target_session(_project_target_url(project)) as tdb:
+        schema = await get_schema_summary(tdb)
     files = (
         await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id).order_by(ProjectFile.created_at.desc()))
     ).scalars().all()
@@ -179,30 +282,54 @@ async def project_context(
     )
 
 
+@app.post("/projects/{project_id}/db/test", response_model=DBTestOut)
+async def db_test(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> DBTestOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
+
+    try:
+        async with target_session(_project_target_url(project)) as tdb:
+            await tdb.execute(text("select 1"))
+            schema = await get_schema_summary(tdb)
+        return DBTestOut(ok=True, message="Connected", schema_summary=schema[:2000])
+    except Exception as e:  # noqa: BLE001
+        return DBTestOut(ok=False, message=str(e), schema_summary="")
+
+
 @app.patch("/projects/{project_id}", response_model=ProjectOut)
-async def patch_project(project_id: uuid.UUID, payload: ProjectPatch, db: AsyncSession = Depends(get_db)) -> ProjectOut:
+async def patch_project(project_id: uuid.UUID, payload: ProjectPatch, request: Request, db: AsyncSession = Depends(get_db)) -> ProjectOut:
+    user_id = _get_user_id(request)
     p = await db.get(Project, project_id)
-    if not p:
+    if not p or p.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     data = payload.model_dump(exclude_unset=True)
     api_key = data.pop("api_key", None)
+    target_database_url = data.pop("target_database_url", None)
     for k, v in data.items():
         setattr(p, k, v)
 
     if api_key is not None:
         p.api_key_encrypted = encrypt_str(api_key) if api_key else None
 
+    if target_database_url is not None:
+        p.target_db_url_encrypted = encrypt_str(target_database_url) if target_database_url else None
+
     p.updated_at = datetime.utcnow()
     await db.commit()
     await db.refresh(p)
-    return ProjectOut.model_validate(p, from_attributes=True)
+    out = ProjectOut.model_validate(p, from_attributes=True)
+    out.target_db_configured = bool(p.target_db_url_encrypted)
+    return out
 
 
 @app.delete("/projects/{project_id}")
-async def delete_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+async def delete_project(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> dict[str, str]:
+    user_id = _get_user_id(request)
     p = await db.get(Project, project_id)
-    if not p:
+    if not p or p.owner_id != user_id:
         raise HTTPException(404, "Project not found")
     await db.execute(delete(Project).where(Project.id == project_id))
     await db.commit()
@@ -213,7 +340,11 @@ async def delete_project(project_id: uuid.UUID, db: AsyncSession = Depends(get_d
 
 
 @app.get("/projects/{project_id}/chat/history", response_model=list[ChatMessageOut])
-async def chat_history(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[ChatMessageOut]:
+async def chat_history(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> list[ChatMessageOut]:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     rows = (
         await db.execute(
             select(ChatMessage).where(ChatMessage.project_id == project_id).order_by(ChatMessage.created_at.asc())
@@ -223,45 +354,91 @@ async def chat_history(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)
 
 
 @app.post("/projects/{project_id}/chat", response_model=ChatMessageOut)
-async def chat(project_id: uuid.UUID, payload: ChatMessageCreate, db: AsyncSession = Depends(get_db), tdb: AsyncSession = Depends(get_target_db)) -> ChatMessageOut:
+async def chat(
+    project_id: uuid.UUID,
+    payload: ChatMessageCreate,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> ChatMessageOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     user_msg = ChatMessage(project_id=project_id, role="user", content=payload.message, meta={})
     db.add(user_msg)
     await db.commit()
 
-    # Minimal Julius-like behavior: try NL→SQL and run if it looks like a data request.
-    schema = await get_schema_summary(tdb)
+    # Julius-like: build context and let LLM propose actions; fallback to NL→SQL.
     assistant_text = ""
     meta: dict[str, Any] = {}
+
+    # Context: schema + files + recent cells (lightweight)
+    async with target_session(_project_target_url(project)) as tdb:
+        schema = await get_schema_summary(tdb)
+
+    files = (
+        await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id).order_by(ProjectFile.created_at.desc()).limit(10))
+    ).scalars().all()
+    cells = (
+        await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.position.desc()).limit(5))
+    ).scalars().all()
+    ctx = "Postgres schema:\n" + schema[:2000] + "\n\n"
+    if files:
+        ctx += "Files:\n" + "\n".join([f"- {f.name}" for f in files]) + "\n\n"
+    if cells:
+        ctx += "Recent workspace cells (sources truncated):\n" + "\n".join([f"- {c.type.value}: {c.source[:200]}" for c in cells]) + "\n"
+
     try:
-        sql = await generate_sql(project, question=payload.message, schema_summary=schema)
-        if not project.allow_writes:
-            assert_read_only(sql)
-        res = await tdb.execute(text(sql))
-        rows = res.fetchmany(10)
-        cols = list(res.keys())
-        assistant_text = (
-            "Here’s a SQL query you can run:\n\n"
-            f"{sql}\n\n"
-            "Preview (first 10 rows):\n"
-            f"Columns: {cols}\n"
-            f"Rows: {rows}"
-        )
+        plan = await chat_with_context(project, user_message=payload.message, context=ctx)
+        assistant_text = str(plan.get("message", "") or "")
         meta = {
-            "actions": [
-                {"type": "insert_sql", "sql": sql},
-                {"type": "create_sql_cell", "sql": sql},
-            ],
-            "citations": [
-                {"type": "postgres_schema", "summary": schema[:2000]},
-            ],
+            "actions": plan.get("actions", []) if isinstance(plan.get("actions", []), list) else [],
+            "citations": plan.get("citations", []) if isinstance(plan.get("citations", []), list) else [],
         }
-    except Exception as e:  # noqa: BLE001
-        assistant_text = f"I couldn’t generate/run SQL automatically: {e}. You can still use the SQL page."
-        meta = {"citations": [{"type": "postgres_schema", "summary": schema[:2000]}]}
+
+        # Optional: if an insert_sql action is present, validate read-only and attach a preview.
+        sql = None
+        for a in meta["actions"]:
+            if isinstance(a, dict) and a.get("type") == "insert_sql" and isinstance(a.get("sql"), str):
+                sql = a["sql"]
+                break
+        if sql:
+            if not project.allow_writes:
+                assert_read_only(sql)
+            async with target_session(_project_target_url(project)) as tdb2:
+                res = await tdb2.execute(text(sql))
+                rows = res.fetchmany(10)
+                cols = list(res.keys())
+            assistant_text = assistant_text + "\n\nSQL preview (first 10 rows):\n" + f"Columns: {cols}\nRows: {rows}"
+
+    except Exception:
+        # Fallback: old behavior (NL→SQL)
+        try:
+            sql = await generate_sql(project, question=payload.message, schema_summary=schema)
+            if not project.allow_writes:
+                assert_read_only(sql)
+            async with target_session(_project_target_url(project)) as tdb2:
+                res = await tdb2.execute(text(sql))
+                rows = res.fetchmany(10)
+                cols = list(res.keys())
+            assistant_text = (
+                "Here’s a SQL query you can run:\n\n"
+                f"{sql}\n\n"
+                "Preview (first 10 rows):\n"
+                f"Columns: {cols}\n"
+                f"Rows: {rows}"
+            )
+            meta = {
+                "actions": [
+                    {"type": "insert_sql", "sql": sql},
+                    {"type": "create_sql_cell", "sql": sql, "run": False},
+                ],
+                "citations": [{"type": "postgres_schema", "summary": schema[:2000]}],
+            }
+        except Exception as e:  # noqa: BLE001
+            assistant_text = f"I couldn’t generate a response: {e}"
+            meta = {"citations": [{"type": "postgres_schema", "summary": schema[:2000]}]}
 
     assistant_msg = ChatMessage(project_id=project_id, role="assistant", content=assistant_text, meta=meta)
     db.add(assistant_msg)
@@ -274,18 +451,33 @@ async def chat(project_id: uuid.UUID, payload: ChatMessageCreate, db: AsyncSessi
 async def chat_stream(
     project_id: uuid.UUID,
     payload: ChatMessageCreate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    tdb: AsyncSession = Depends(get_target_db),
 ) -> StreamingResponse:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     user_msg = ChatMessage(project_id=project_id, role="user", content=payload.message, meta={})
     db.add(user_msg)
     await db.commit()
 
-    schema = await get_schema_summary(tdb)
+    # Pre-fetch schema/context once
+    async with target_session(_project_target_url(project)) as tdb:
+        schema = await get_schema_summary(tdb)
+
+    files = (
+        await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id).order_by(ProjectFile.created_at.desc()).limit(10))
+    ).scalars().all()
+    cells = (
+        await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.position.desc()).limit(5))
+    ).scalars().all()
+    ctx = "Postgres schema:\n" + schema[:2000] + "\n\n"
+    if files:
+        ctx += "Files:\n" + "\n".join([f"- {f.name}" for f in files]) + "\n\n"
+    if cells:
+        ctx += "Recent workspace cells (sources truncated):\n" + "\n".join([f"- {c.type.value}: {c.source[:200]}" for c in cells]) + "\n"
 
     async def gen() -> Any:
         yield _sse("starting", event="status")
@@ -294,28 +486,28 @@ async def chat_stream(
         assistant_text = ""
         meta: dict[str, Any] = {}
         try:
-            sql = await generate_sql(project, question=payload.message, schema_summary=schema)
-            if not project.allow_writes:
-                assert_read_only(sql)
-            res = await tdb.execute(text(sql))
-            rows = res.fetchmany(10)
-            cols = list(res.keys())
-            assistant_text = (
-                "Here’s a SQL query you can run:\n\n"
-                f"{sql}\n\n"
-                "Preview (first 10 rows):\n"
-                f"Columns: {cols}\n"
-                f"Rows: {rows}"
-            )
+            plan = await chat_with_context(project, user_message=payload.message, context=ctx)
+            assistant_text = str(plan.get("message", "") or "")
             meta = {
-                "actions": [
-                    {"type": "insert_sql", "sql": sql},
-                    {"type": "create_sql_cell", "sql": sql},
-                ],
-                "citations": [{"type": "postgres_schema", "summary": schema[:2000]}],
+                "actions": plan.get("actions", []) if isinstance(plan.get("actions", []), list) else [],
+                "citations": plan.get("citations", []) if isinstance(plan.get("citations", []), list) else [],
             }
+
+            sql = None
+            for a in meta["actions"]:
+                if isinstance(a, dict) and a.get("type") == "insert_sql" and isinstance(a.get("sql"), str):
+                    sql = a["sql"]
+                    break
+            if sql:
+                if not project.allow_writes:
+                    assert_read_only(sql)
+                async with target_session(_project_target_url(project)) as tdb2:
+                    res = await tdb2.execute(text(sql))
+                    rows = res.fetchmany(10)
+                    cols = list(res.keys())
+                assistant_text = assistant_text + "\n\nSQL preview (first 10 rows):\n" + f"Columns: {cols}\nRows: {rows}"
         except Exception as e:  # noqa: BLE001
-            assistant_text = f"I couldn’t generate/run SQL automatically: {e}. You can still use the SQL page."
+            assistant_text = f"I couldn’t generate a response: {e}"
             meta = {"citations": [{"type": "postgres_schema", "summary": schema[:2000]}]}
 
         # Stream content in chunks (v1); can be replaced with true token streaming later.
@@ -336,12 +528,14 @@ async def chat_stream(
 
 
 @app.post("/projects/{project_id}/sql/generate", response_model=SQLGenerateOut)
-async def sql_generate(project_id: uuid.UUID, payload: SQLGenerateIn, db: AsyncSession = Depends(get_db), tdb: AsyncSession = Depends(get_target_db)) -> SQLGenerateOut:
+async def sql_generate(project_id: uuid.UUID, payload: SQLGenerateIn, request: Request, db: AsyncSession = Depends(get_db)) -> SQLGenerateOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
-    schema = await get_schema_summary(tdb)
+    async with target_session(_project_target_url(project)) as tdb:
+        schema = await get_schema_summary(tdb)
     sql = await generate_sql(project, question=payload.question, schema_summary=schema)
     if not project.allow_writes:
         assert_read_only(sql)
@@ -349,22 +543,28 @@ async def sql_generate(project_id: uuid.UUID, payload: SQLGenerateIn, db: AsyncS
 
 
 @app.post("/projects/{project_id}/sql/run", response_model=SQLRunOut)
-async def sql_run(project_id: uuid.UUID, payload: SQLRunIn, db: AsyncSession = Depends(get_db), tdb: AsyncSession = Depends(get_target_db)) -> SQLRunOut:
+async def sql_run(project_id: uuid.UUID, payload: SQLRunIn, request: Request, db: AsyncSession = Depends(get_db)) -> SQLRunOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     if not project.allow_writes:
         assert_read_only(payload.sql)
 
-    res = await tdb.execute(text(payload.sql))
-    rows = res.fetchmany(200)
-    cols = list(res.keys())
-    return SQLRunOut(columns=cols, rows=[list(r) for r in rows], row_count=len(rows))
+    async with target_session(_project_target_url(project)) as tdb:
+        res = await tdb.execute(text(payload.sql))
+        rows = res.fetchmany(200)
+        cols = list(res.keys())
+        return SQLRunOut(columns=cols, rows=[list(r) for r in rows], row_count=len(rows))
 
 
 @app.get("/projects/{project_id}/sql/saved", response_model=list[SavedQueryOut])
-async def sql_saved(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[SavedQueryOut]:
+async def sql_saved(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> list[SavedQueryOut]:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     rows = (
         await db.execute(select(SavedQuery).where(SavedQuery.project_id == project_id).order_by(SavedQuery.created_at.desc()))
     ).scalars().all()
@@ -372,7 +572,11 @@ async def sql_saved(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -
 
 
 @app.post("/projects/{project_id}/sql/saved", response_model=SavedQueryOut)
-async def sql_saved_create(project_id: uuid.UUID, payload: SavedQueryCreate, db: AsyncSession = Depends(get_db)) -> SavedQueryOut:
+async def sql_saved_create(project_id: uuid.UUID, payload: SavedQueryCreate, request: Request, db: AsyncSession = Depends(get_db)) -> SavedQueryOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     q = SavedQuery(project_id=project_id, name=payload.name, sql=payload.sql)
     db.add(q)
     await db.commit()
@@ -384,9 +588,10 @@ async def sql_saved_create(project_id: uuid.UUID, payload: SavedQueryCreate, db:
 
 
 @app.post("/projects/{project_id}/files/upload", response_model=FileOut)
-async def upload_file(project_id: uuid.UUID, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)) -> FileOut:
+async def upload_file(project_id: uuid.UUID, request: Request, file: UploadFile = File(...), db: AsyncSession = Depends(get_db)) -> FileOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     upload_dir = _project_dir(project_id) / "uploads"
@@ -412,7 +617,11 @@ async def upload_file(project_id: uuid.UUID, file: UploadFile = File(...), db: A
 
 
 @app.get("/projects/{project_id}/files", response_model=list[FileOut])
-async def list_files(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[FileOut]:
+async def list_files(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> list[FileOut]:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     rows = (
         await db.execute(select(ProjectFile).where(ProjectFile.project_id == project_id).order_by(ProjectFile.created_at.desc()))
     ).scalars().all()
@@ -420,7 +629,11 @@ async def list_files(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) 
 
 
 @app.get("/projects/{project_id}/files/{file_id}/preview", response_model=FilePreviewOut)
-async def get_file_preview(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> FilePreviewOut:
+async def get_file_preview(project_id: uuid.UUID, file_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> FilePreviewOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     pf = await db.get(ProjectFile, file_id)
     if not pf or pf.project_id != project_id:
         raise HTTPException(404, "File not found")
@@ -434,7 +647,11 @@ async def get_file_preview(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncS
 
 
 @app.get("/projects/{project_id}/files/{file_id}/profile", response_model=FileProfileOut)
-async def get_file_profile(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> FileProfileOut:
+async def get_file_profile(project_id: uuid.UUID, file_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> FileProfileOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     pf = await db.get(ProjectFile, file_id)
     if not pf or pf.project_id != project_id:
         raise HTTPException(404, "File not found")
@@ -448,7 +665,11 @@ async def get_file_profile(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncS
 
 
 @app.post("/projects/{project_id}/files/{file_id}/analyze", response_model=FileAnalyzeOut)
-async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> FileAnalyzeOut:
+async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> FileAnalyzeOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     pf = await db.get(ProjectFile, file_id)
     if not pf or pf.project_id != project_id:
         raise HTTPException(404, "File not found")
@@ -473,7 +694,7 @@ async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSessi
         if isinstance(name, str) and c.get("top_values"):
             categorical.append(name)
 
-    # Build deterministic suggestions (LLM integration can be layered on top).
+    # Build deterministic suggestions; if LLM is configured, prefer LLM-generated suggestions with fallback.
     read_code = (
         "import pandas as pd\n"
         f"path = {pf.path!r}\n"
@@ -489,6 +710,33 @@ async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSessi
     )
 
     suggestions: list[FileAnalysisSuggestion] = []
+
+    # Try LLM first (if available) and fall back to deterministic suggestions if parsing fails.
+    try:
+        profile_summary = str(profile)[:8000]
+        llm_out = await generate_file_suggestions(project, filename=pf.name, profile_summary=profile_summary)
+        raw_suggestions = llm_out.get("suggestions", [])
+        if isinstance(raw_suggestions, list) and raw_suggestions:
+            parsed: list[FileAnalysisSuggestion] = []
+            for s in raw_suggestions[:8]:
+                if not isinstance(s, dict):
+                    continue
+                title = str(s.get("title", "")).strip()
+                if not title:
+                    continue
+                parsed.append(
+                    FileAnalysisSuggestion(
+                        title=title,
+                        description=str(s.get("description", "") or ""),
+                        cell_type=(s.get("cell_type") if s.get("cell_type") in {"python", "markdown"} else "python"),
+                        code=str(s.get("code", "") or ""),
+                    )
+                )
+            if parsed:
+                return FileAnalyzeOut(suggestions=parsed)
+    except Exception:
+        pass
+
     suggestions.append(
         FileAnalysisSuggestion(
             title="Load file and show head()",
@@ -539,7 +787,11 @@ async def analyze_file(project_id: uuid.UUID, file_id: uuid.UUID, db: AsyncSessi
 
 
 @app.get("/projects/{project_id}/workspace", response_model=list[WorkspaceCellOut])
-async def workspace_get(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> list[WorkspaceCellOut]:
+async def workspace_get(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> list[WorkspaceCellOut]:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     rows = (
         await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.position.asc()))
     ).scalars().all()
@@ -547,7 +799,11 @@ async def workspace_get(project_id: uuid.UUID, db: AsyncSession = Depends(get_db
 
 
 @app.post("/projects/{project_id}/workspace/cells", response_model=WorkspaceCellOut)
-async def workspace_add_cell(project_id: uuid.UUID, payload: WorkspaceCellCreate, db: AsyncSession = Depends(get_db)) -> WorkspaceCellOut:
+async def workspace_add_cell(project_id: uuid.UUID, payload: WorkspaceCellCreate, request: Request, db: AsyncSession = Depends(get_db)) -> WorkspaceCellOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     existing = (
         await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.position.desc()))
     ).scalars().first()
@@ -561,7 +817,11 @@ async def workspace_add_cell(project_id: uuid.UUID, payload: WorkspaceCellCreate
 
 
 @app.patch("/projects/{project_id}/workspace/cells/{cell_id}", response_model=WorkspaceCellOut)
-async def workspace_patch_cell(project_id: uuid.UUID, cell_id: uuid.UUID, payload: WorkspaceCellPatch, db: AsyncSession = Depends(get_db)) -> WorkspaceCellOut:
+async def workspace_patch_cell(project_id: uuid.UUID, cell_id: uuid.UUID, payload: WorkspaceCellPatch, request: Request, db: AsyncSession = Depends(get_db)) -> WorkspaceCellOut:
+    user_id = _get_user_id(request)
+    project = await db.get(Project, project_id)
+    if not project or project.owner_id != user_id:
+        raise HTTPException(404, "Project not found")
     c = await db.get(WorkspaceCell, cell_id)
     if not c or c.project_id != project_id:
         raise HTTPException(404, "Cell not found")
@@ -576,30 +836,34 @@ async def workspace_patch_cell(project_id: uuid.UUID, cell_id: uuid.UUID, payloa
 
 
 @app.post("/projects/{project_id}/workspace/cells/{cell_id}/run", response_model=ExecuteOut)
-async def workspace_run_cell(project_id: uuid.UUID, cell_id: uuid.UUID, db: AsyncSession = Depends(get_db), tdb: AsyncSession = Depends(get_target_db)) -> ExecuteOut:
+async def workspace_run_cell(project_id: uuid.UUID, cell_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> ExecuteOut:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     c = await db.get(WorkspaceCell, cell_id)
     if not c or c.project_id != project_id:
         raise HTTPException(404, "Cell not found")
-    return await _run_cell(project, c, db=db, tdb=tdb)
+    async with target_session(_project_target_url(project)) as tdb:
+        return await _run_cell(project, c, db=db, tdb=tdb)
 
 
 @app.post("/projects/{project_id}/workspace/run_all", response_model=list[ExecuteOut])
-async def workspace_run_all(project_id: uuid.UUID, db: AsyncSession = Depends(get_db), tdb: AsyncSession = Depends(get_target_db)) -> list[ExecuteOut]:
+async def workspace_run_all(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> list[ExecuteOut]:
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     rows = (
         await db.execute(select(WorkspaceCell).where(WorkspaceCell.project_id == project_id).order_by(WorkspaceCell.position.asc()))
     ).scalars().all()
     outs: list[ExecuteOut] = []
-    for c in rows:
-        if c.type in {CellType.python, CellType.sql}:
-            outs.append(await _run_cell(project, c, db=db, tdb=tdb))
+    async with target_session(_project_target_url(project)) as tdb:
+        for c in rows:
+            if c.type in {CellType.python, CellType.sql}:
+                outs.append(await _run_cell(project, c, db=db, tdb=tdb))
     return outs
 
 
@@ -607,11 +871,12 @@ async def workspace_run_all(project_id: uuid.UUID, db: AsyncSession = Depends(ge
 
 
 @app.post("/projects/{project_id}/export/ipynb")
-async def export_ipynb(project_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> FileResponse:
+async def export_ipynb(project_id: uuid.UUID, request: Request, db: AsyncSession = Depends(get_db)) -> FileResponse:
     import nbformat as nbf
 
+    user_id = _get_user_id(request)
     project = await db.get(Project, project_id)
-    if not project:
+    if not project or project.owner_id != user_id:
         raise HTTPException(404, "Project not found")
 
     rows = (

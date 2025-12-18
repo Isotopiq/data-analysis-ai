@@ -15,15 +15,6 @@ engine = create_engine(settings.database_url)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
-target_engine = create_engine(settings.target_database_url)
-TargetSessionLocal = async_sessionmaker(target_engine, expire_on_commit=False)
-
-
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with SessionLocal() as session:
-        yield session
-
-
-async def get_target_db() -> AsyncGenerator[AsyncSession, None]:
-    async with TargetSessionLocal() as session:
         yield session

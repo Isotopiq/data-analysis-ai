@@ -20,6 +20,7 @@ class ProjectPatch(BaseModel):
     llm_temperature: int | None = Field(default=None, ge=0, le=2)
     api_base_url: str | None = None
     api_key: str | None = None
+    target_database_url: str | None = None
     allow_writes: bool | None = None
 
 
@@ -31,6 +32,7 @@ class ProjectOut(BaseModel):
     llm_temperature: int
     api_base_url: str | None
     allow_writes: bool
+    target_db_configured: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -111,6 +113,12 @@ class ProjectContextOut(BaseModel):
     schema_summary: str
     files: list[FileOut]
     recent_cells: list[WorkspaceCellOut]
+
+
+class DBTestOut(BaseModel):
+    ok: bool
+    message: str = ""
+    schema_summary: str = ""
 
 
 class WorkspaceCellCreate(BaseModel):

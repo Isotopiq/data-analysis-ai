@@ -14,6 +14,7 @@ type Project = {
   llm_temperature: number;
   api_base_url: string | null;
   allow_writes: boolean;
+  target_db_configured?: boolean;
 };
 
 export default function SettingsPage() {
@@ -22,6 +23,8 @@ export default function SettingsPage() {
 
   const [p, setP] = useState<Project | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [targetDbUrl, setTargetDbUrl] = useState("");
+  const [dbStatus, setDbStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -59,6 +62,45 @@ export default function SettingsPage() {
 
       <Card>
         <div className="space-y-4">
+          <div className="rounded border p-3">
+            <div className="text-sm font-semibold">Postgres (target DB)</div>
+            <div className="mt-1 text-xs text-gray-600">
+              Connection string is stored encrypted; it is not displayed back.
+            </div>
+            <div className="mt-3">
+              <Label>Connection string</Label>
+              <TextInput
+                className="mt-1"
+                value={targetDbUrl}
+                onChange={(e) => setTargetDbUrl(e.target.value)}
+                placeholder="postgresql+asyncpg://user:pass@host:5432/dbname"
+              />
+              <div className="mt-1 text-xs text-gray-500">
+                Current status:{" "}
+                <span className="font-medium">
+                  {p.target_db_configured ? "Configured" : "Not configured (using default env DB)"}
+                </span>
+              </div>
+              <div className="mt-2 flex items-center gap-2">
+                <Button
+                  size="xs"
+                  color="gray"
+                  onClick={async () => {
+                    try {
+                      const out = await apiGet<any>(`/projects/${projectId}/context`);
+                      setDbStatus(out?.schema_summary ? "Connected (schema loaded)" : "No schema returned");
+                    } catch (e: any) {
+                      setDbStatus(e?.message || String(e));
+                    }
+                  }}
+                >
+                  Check connection
+                </Button>
+                {dbStatus && <div className="text-xs text-gray-600">{dbStatus}</div>}
+              </div>
+            </div>
+          </div>
+
           <div>
             <Label>LLM Provider</Label>
             <Select
@@ -128,10 +170,12 @@ export default function SettingsPage() {
                     llm_model: p.llm_model,
                     api_base_url: p.api_base_url,
                     api_key: apiKey || undefined,
+                    target_database_url: targetDbUrl || undefined,
                     allow_writes: p.allow_writes,
                   });
                   setP(updated);
                   setApiKey("");
+                  setTargetDbUrl("");
                   setSelectedProject(updated);
                 } catch (e: any) {
                   setError(e?.message || String(e));

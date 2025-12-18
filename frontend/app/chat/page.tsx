@@ -61,6 +61,7 @@ export default function ChatPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text }),
+        credentials: "include",
       });
       if (!res.ok || !res.body) throw new Error(await res.text());
 
@@ -173,6 +174,55 @@ export default function ChatPage() {
                           Create + run
                         </Button>
                       </div>
+                    );
+                  }
+
+                  if (a.type === "create_python_cell") {
+                    return (
+                      <div key={idx} className="flex gap-2">
+                        <Button
+                          size="xs"
+                          color="gray"
+                          onClick={async () => {
+                            const code = a.code || "";
+                            await apiPost(`/projects/${projectId}/workspace/cells`, { type: "python", source: code });
+                            router.push("/workspace");
+                          }}
+                        >
+                          Create Python cell
+                        </Button>
+                        <Button
+                          size="xs"
+                          onClick={async () => {
+                            const code = a.code || "";
+                            const cell = await apiPost<any>(`/projects/${projectId}/workspace/cells`, { type: "python", source: code });
+                            if (a.run) {
+                              await apiPost(`/projects/${projectId}/workspace/cells/${cell.id}/run`, {});
+                            }
+                            router.push("/workspace");
+                          }}
+                        >
+                          Create{a.run ? " + run" : ""}
+                        </Button>
+                      </div>
+                    );
+                  }
+
+                  if (a.type === "save_query") {
+                    return (
+                      <Button
+                        key={idx}
+                        size="xs"
+                        color="gray"
+                        onClick={async () => {
+                          const name = a.name || "Saved from chat";
+                          const sql = a.sql || "";
+                          if (!sql.trim()) return;
+                          await apiPost(`/projects/${projectId}/sql/saved`, { name, sql });
+                        }}
+                      >
+                        Save as query
+                      </Button>
                     );
                   }
 

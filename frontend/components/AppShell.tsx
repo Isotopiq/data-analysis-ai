@@ -15,6 +15,7 @@ import {
 
 import { useAppStore } from "@/lib/store";
 import { ProjectContextDrawer } from "@/components/ProjectContextDrawer";
+import { apiPost } from "@/lib/api";
 
 const navItems = [
   { href: "/projects", label: "Projects", icon: HiCollection },
@@ -29,6 +30,10 @@ const navItems = [
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const selectedProject = useAppStore((s) => s.selectedProject);
+
+  if (pathname.startsWith("/login")) {
+    return <div className="min-h-screen bg-gray-50 p-8">{children}</div>;
+  }
 
   return (
     <div className="h-screen w-screen bg-gray-50 text-gray-900">
@@ -48,6 +53,18 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               LLM: {selectedProject.llm_provider}/{selectedProject.llm_model}
             </div>
           )}
+          <button
+            className="ml-2 rounded border px-2 py-1 text-xs text-gray-700 hover:bg-gray-50"
+            onClick={async () => {
+              try {
+                await apiPost(`/auth/logout`, {});
+              } finally {
+                window.location.href = "/login";
+              }
+            }}
+          >
+            Logout
+          </button>
         </div>
       </Navbar>
 

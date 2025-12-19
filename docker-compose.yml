@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  executor:
+    build:
+      context: ./executor
+    environment:
+      EXECUTOR_DEFAULT_TIMEOUT_S: "60"
+      EXECUTOR_DEFAULT_MEMORY_MB: "1024"
+      EXECUTOR_DISABLE_NETWORK: "true"
+    volumes:
+      - ./data/projects:/data/projects
+    ports:
+      - "8001:8001"
+
+  api:
+    build:
+      context: ./api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/appdb
+      TARGET_DATABASE_URL: postgresql+asyncpg://app:app@postgres:5432/appdb
+      EXECUTOR_URL: http://executor:8001
+      OLLAMA_BASE_URL: http://ollama:11434
+      OPENAI_BASE_URL: ""
+      OPENAI_API_KEY: ""
+      CORS_ORIGINS: http://localhost:3000
+    volumes:
+      - ./data/projects:/data/projects
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - executor
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: /api
+      API_PROXY_TARGET: http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:
+  ollama:
